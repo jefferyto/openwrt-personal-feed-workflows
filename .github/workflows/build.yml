@@ -1,0 +1,258 @@
+name: Personal Feed Build
+
+on:
+  workflow_call:
+    inputs:
+      config-file-branch:
+        description: Use config file from this branch
+        default: ${{ github.event.repository.default_branch }}
+        type: string
+
+      config-file-name:
+        description: Filename for config file
+        default: config.yml
+        type: string
+
+    secrets:
+      apk-private-key:
+        description: Private (secret) key used to sign apk packages
+        required: false
+
+      opkg-secret-key:
+        description: Secret (private) key used to sign opkg packages
+        required: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  setup:
+    name: Setup
+    runs-on: ubuntu-slim
+    outputs:
+      matrix-include: ${{ steps.prepare-matrix-include.outputs.matrix-include }}
+
+    steps:
+      - name: Check out config branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.config-file-branch }}
+          fetch-depth: 0
+
+      - name: Read config file
+        id: read-config
+        env:
+          CONFIG_FILE: ${{ inputs.config-file-name }}
+        run: |
+          config="$(yq -o=json -I=0 '.' "$CONFIG_FILE")"
+          echo "$config" | jq '.'
+          echo "config=$config" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare build matrix include list
+        id: prepare-matrix-include
+        env:
+          CONFIG: ${{ steps.read-config.outputs.config }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          include="$(
+            echo "$CONFIG" |
+            jq -c '
+              .build.targets
+              | map(
+                select(.version and .target and .subtarget)
+                | { branch: $ENV.DEFAULT_BRANCH } + .
+                | (select(.version == "main" or .version == "master")).version = "snapshot"
+                | (select((.["sdk-suffix"] | not) and .version == "snapshot")).["sdk-suffix"] = "SNAPSHOT"
+                | (select((.["sdk-suffix"] | not) and (.version | test("^\\d+\\.\\d+$")))).["sdk-suffix"] = .version + "-SNAPSHOT"
+                | (select(.["sdk-suffix"] | not)).["sdk-suffix"] = .version
+              )
+            '
+          )"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            include="$(
+              echo "$include" |
+              jq -c --arg branch "${GITHUB_BASE_REF#refs/heads/}" '
+                map(select(.branch == $branch))
+              '
+            )"
+          fi
+          echo "$include" | jq '.'
+          echo "matrix-include=$include" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.version }}/${{ matrix.target }}/${{ matrix.subtarget }}
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.setup.outputs.matrix-include) }}
+
+    steps:
+      - name: Remove unused Android SDK, .NET, Swift, GHC
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/share/swift
+
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+
+      - name: Build
+        uses: openwrt/gh-action-sdk@v11
+        env:
+          ARCH: ${{ matrix.target }}-${{ matrix.subtarget }}-${{ matrix.sdk-suffix }}
+          FEEDNAME: personal
+          INDEX: 1
+          KEY_BUILD: ${{ secrets.opkg-secret-key }}
+          PRIVATE_KEY: ${{ secrets.apk-private-key }}
+          V: s
+
+      - name: Move created packages to project dir
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          dir="$(find bin/packages -mindepth 2 -maxdepth 2 -name personal -type d -not -empty -print -quit)"
+          if [ -n "$dir" ]; then
+            cp -v "$dir"/* .
+          fi
+
+      - name: Collect metadata
+        id: collect-metadata
+        if: ${{ !cancelled() }}
+        env:
+          SUBTARGET: ${{ matrix.subtarget }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          commit="$(git rev-parse --short HEAD)"
+          archive="$VERSION-$TARGET-$SUBTARGET-$commit"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            pr="${GITHUB_REF_NAME%/merge}"
+            archive="$VERSION-$TARGET-$SUBTARGET-PR$pr-$commit"
+          fi
+          echo "archive-name=$archive" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+
+      - name: Generate metadata
+        if: ${{ !cancelled() }}
+        env:
+          ARCHIVE: ${{ steps.collect-metadata.outputs.archive-name }}
+          BRANCH: ${{ matrix.branch }}
+          COMMIT: ${{ steps.collect-metadata.outputs.commit }}
+          PR: ${{ steps.collect-metadata.outputs.pr }}
+          SUBTARGET: ${{ matrix.subtarget }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            base_id="$(git rev-parse --short HEAD^1)"
+            head_id="$(git rev-parse --short HEAD^2)"
+            homepage="pull/$PR"
+            description="Packages for OpenWrt $VERSION running on $TARGET/$SUBTARGET, built from PR $PR at commit $head_id, against $BRANCH at commit $base_id, with merge SHA $COMMIT."
+          else
+            homepage="tree/$BRANCH"
+            description="Packages for OpenWrt $VERSION running on $TARGET/$SUBTARGET, built from $BRANCH at commit $COMMIT."
+          fi
+          cat << _EOF_ > PKG-INFO
+          Metadata-Version: 2.1
+          Name: $ARCHIVE
+          Version: $VERSION
+          Author: $GITHUB_ACTOR
+          Home-page: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/$homepage
+          Download-URL: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          Platform: $TARGET/$SUBTARGET
+
+          $description
+
+          Full file listing:
+          _EOF_
+          ls -al *.ipk >> PKG-INFO || true
+          ls -al *.apk >> PKG-INFO || true
+          cat PKG-INFO
+
+      - name: Store packages
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.collect-metadata.outputs.archive-name }}-packages
+          path: |
+            Packages
+            Packages.*
+            *.ipk
+            packages.adb
+            *.apk
+            PKG-INFO
+
+      - name: Store logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.collect-metadata.outputs.archive-name }}-logs
+          path: |
+            logs/
+            PKG-INFO
+
+  deploy:
+    name: Deploy
+    needs: [setup, build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-slim
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy-feed.outputs.page_url }}
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: packages
+          pattern: '*-packages'
+
+      - name: Set up feed structure
+        env:
+          INCLUDE: ${{ needs.setup.outputs.matrix-include }}
+        run: |
+          mkdir feed
+          echo "$INCLUDE" |
+            jq -r 'map(.version + "|" + .target + "|" + .subtarget) | @sh' |
+            tr -d "'" | tr ' ' '\n' |
+            while IFS="|" read -r version target subtarget; do
+              packages_dir="$(find packages -mindepth 1 -maxdepth 1 -name "$version-$target-$subtarget-*" -type d -not -empty -print -quit)"
+              if [ -z "$packages_dir" ]; then
+                continue
+              fi
+              if [ ! -f "$packages_dir/Packages" ] && [ ! -f "$packages_dir/packages.adb" ]; then
+                continue
+              fi
+              path="releases/$version"
+              if [ "$version" = "snapshot" ]; then
+                path="snapshots"
+              fi
+              mkdir -p "feed/$path/$target"
+              rm -rf "feed/$path/$target/$subtarget"
+              mv "$packages_dir" "feed/$path/$target/$subtarget"
+            done
+          if [ -z "$(find feed -name '*.[ai]pk' -type f -print -quit)" ]; then
+            echo "No packages found"
+            exit 1
+          fi
+          ls -alR feed
+
+      - name: Store feed
+        uses: actions/upload-pages-artifact@v5
+        with:
+          name: feed-${{ github.run_attempt }}
+          path: feed
+
+      - name: Deploy feed
+        id: deploy-feed
+        uses: actions/deploy-pages@v5
+        with:
+          artifact_name: feed-${{ github.run_attempt }}
